@@ -154,6 +154,17 @@ class SyncVectorEnv(VectorEnv):
                 deepcopy(self.observations) if self.copy else self.observations
             ), data_list
 
+    def reset_arg(self, options_list, **kwargs):
+        self._terminates[:] = False
+        self._truncates[:] = False
+        observations = []
+        for env, options in zip(self.envs, options_list):
+            observations.append(env.reset(options=options, **kwargs))
+        self.observations = concatenate(
+            self.single_observation_space, observations, self.observations
+        )
+        return deepcopy(self.observations) if self.copy else self.observations
+
     def step_async(self, actions):
         self._actions = iterate(self.action_space, actions)
 

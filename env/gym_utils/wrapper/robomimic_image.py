@@ -135,8 +135,13 @@ class RobomimicImageWrapper(gym.Env):
                     obs["state"] = np.concatenate([obs["state"], raw_obs[key]], axis=-1)
         if self.normalize:
             obs["state"] = self.normalize_obs(obs["state"])
-        # Convert to float and scale: [0, 255] uint8 -> [0, 255] float
+        # Training images are uint8-like [0, 255], while some robomimic /
+        # robosuite versions return camera observations as float [0, 1].
+        # Keep the model-facing scale consistent because VitEncoder normalizes
+        # by dividing by 255 internally.
         obs["rgb"] = obs["rgb"].astype(np.float32)
+        if obs["rgb"].max() <= 1.5:
+            obs["rgb"] *= 255.0
         return obs
 
     def seed(self, seed=None):
@@ -197,6 +202,18 @@ class RobomimicImageWrapper(gym.Env):
             width=w,
             camera_name=self.render_camera_name,
         )
+
+    def close(self):
+        if self.video_writer is not None:
+            self.video_writer.close()
+            self.video_writer = None
+        close_fn = getattr(self.env, "close", None)
+        if callable(close_fn):
+            close_fn()
+        inner_env = getattr(self.env, "env", None)
+        inner_close = getattr(inner_env, "close", None)
+        if callable(inner_close):
+            inner_close()
 
 
 if __name__ == "__main__":

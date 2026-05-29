@@ -74,12 +74,20 @@ class EvalAgent:
         print(f"[DEBUG] Number of environments: {cfg.env.n_envs}")
         self.env_name = cfg.env.name
         env_type = cfg.env.get("env_type", None)
+        is_robomimic_image = (
+            cfg.get("robomimic_env_cfg_path", None) is not None
+            and cfg.env.get("use_image_obs", False)
+        )
+        asynchronous = cfg.env.get("asynchronous", None)
+        if asynchronous is None:
+            asynchronous = not is_robomimic_image
+        print(f"[DEBUG] Async vector env: {asynchronous}")
         print(f"[DEBUG] Calling make_async...")
         self.venv = make_async(
             cfg.env.name,
             env_type=env_type,
             num_envs=cfg.env.n_envs,
-            asynchronous=True,
+            asynchronous=asynchronous,
             max_episode_steps=cfg.env.max_episode_steps,
             wrappers=cfg.env.get("wrappers", None),
             robomimic_env_cfg_path=cfg.get("robomimic_env_cfg_path", None),
@@ -311,6 +319,7 @@ class EvalAgent:
         
         statistics = read_eval_statistics(npz_file_path=eval_statistics_path)
         self.plot_eval_statistics(statistics, self.eval_log_dir)
+        self.venv.close()
 
     def single_run(self, num_denoising_steps, options_venv):
         import cv2

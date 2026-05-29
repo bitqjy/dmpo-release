@@ -3,10 +3,10 @@ defaults:
 hydra:
   run:
     dir: ${logdir}
-_target_: agent.eval.eval_meanflow_img_agent.EvalImgMeanFlowAgent
+_target_: agent.eval.eval_reflow_img_agent.EvalImgReFlowAgent
 
-name: ${env_name}_eval_meanflow_mlp_img_ta${horizon_steps}_td${denoising_steps}
-logdir: 
+name: ${env_name}_eval_reflow_xpred_mlp_img_ta${horizon_steps}_td${denoising_steps}
+logdir:
   ${oc.env:REINFLOW_LOG_DIR}/robomimic/eval/${name}/${now:%Y-%m-%d}_${now:%H-%M-%S}_${seed}
 base_policy_path:
 robomimic_env_cfg_path: cfg/robomimic/env_meta/${env_name}-img.json
@@ -15,17 +15,17 @@ normalization_path: ${oc.env:REINFLOW_DATA_DIR}/robomimic/${env_name}-img/normal
 load_ema: true
 seed: 42
 device: cuda:0
-env_name: transport
-obs_dim: 18
-action_dim: 14
+env_name: lift
+obs_dim: 9
+action_dim: 7
 denoising_steps: 100
 cond_steps: 1
 img_cond_steps: 1
-horizon_steps: 8
-act_steps: 8
+horizon_steps: 4
+act_steps: 4
 denoising_step_list: [1, 2, 4, 5, 8, 16, 32, 64, 128]
 
-n_steps: 200  # each episode takes max_episode_steps / act_steps steps
+n_steps: 300
 render_num: 0
 batch_size: 128
 
@@ -33,15 +33,14 @@ env:
   n_envs: 5
   name: ${env_name}
   best_reward_threshold_for_success: 1
-  max_episode_steps: 800
+  max_episode_steps: 300
   save_video: false
   use_image_obs: true
   wrappers:
     robomimic_image:
       normalization_path: ${normalization_path}
-      low_dim_keys: ['robot0_eef_pos', 'robot0_eef_quat', 'robot0_gripper_qpos', "robot1_eef_pos",
-        "robot1_eef_quat", "robot1_gripper_qpos"]
-      image_keys: ['shouldercamera0_image', 'shouldercamera1_image']
+      low_dim_keys: ['robot0_eef_pos', 'robot0_eef_quat', 'robot0_gripper_qpos']
+      image_keys: ['robot0_eye_in_hand_image']
       shape_meta: ${shape_meta}
     multi_step:
       n_obs_steps: ${cond_steps}
@@ -53,20 +52,20 @@ env:
 shape_meta:
   obs:
     rgb:
-      shape: [6, 96, 96]
+      shape: [3, 96, 96]
     state:
-      shape: [18]
+      shape: [9]
   action:
-    shape: [14]
+    shape: [7]
 
 model:
-  _target_: model.flow.meanflow.MeanFlow
+  _target_: model.flow.reflow_xpred.XPredReFlow
   network:
-    _target_: model.flow.mlp_meanflow.MeanFlowViT
+    _target_: model.flow.mlp_flow.VisionFlowMLP
     backbone:
       _target_: model.common.vit.VitEncoder
       obs_shape: ${shape_meta.obs.rgb.shape}
-      num_channel: ${eval:'6 * ${img_cond_steps}'} # each image patch is history concatenated
+      num_channel: ${eval:'${shape_meta.obs.rgb.shape[0]} * ${img_cond_steps}'}
       cfg:
         patch_size: 8
         depth: 1
@@ -74,22 +73,15 @@ model:
         num_heads: 4
         embed_style: embed2
         embed_norm: 0
-    action_dim: ${action_dim}
-    horizon_steps: ${horizon_steps}
-    cond_dim: ${eval:'${obs_dim} * ${cond_steps}'}
     img_cond_steps: ${img_cond_steps}
-    time_dim: 16
-    r_embedding_dim: 16
-    mlp_dims: [768, 768, 768]
-    activation_type: Mish
-    out_activation_type: Identity
-    use_layernorm: false
-    residual_style: true
-    spatial_emb: 128
-    visual_feature_dim: 128
-    dropout: 0.1
-    num_img: 2
     augment: true
+    spatial_emb: 128
+    time_dim: 32
+    mlp_dims: [512, 512, 512]
+    residual_style: true
+    cond_dim: ${eval:'${obs_dim} * ${cond_steps}'}
+    horizon_steps: ${horizon_steps}
+    action_dim: ${action_dim}
   device: ${device}
   horizon_steps: ${horizon_steps}
   action_dim: ${action_dim}
@@ -98,8 +90,11 @@ model:
   obs_dim: ${obs_dim}
   max_denoising_steps: ${denoising_steps}
   seed: ${seed}
-  flow_ratio: 0.5
-  gamma: 0.5
-  c: 1e-3
-  sample_t_type: uniform
-  use_adaptive_loss: false
+  sample_t_type: beta
+  t_eps: 0.05
+  loss_fp32: true
+  repeated_flow_samples: 2
+  noise_beta_alpha: 1.5
+  noise_beta_beta: 1.0
+  noise_s: 0.999
+  clip_sample: true

@@ -542,29 +542,44 @@ class PreTrainAgent:
         else:
             loadpath = os.path.join(self.checkpoint_dir, f"state_{epoch}.pt")
 
-        data = torch.load(loadpath)
+        data = torch.load(loadpath, map_location=self.device)
 
-        self.epoch = data["epoch"]
-        self.first_epoch = self.epoch + 1
+        resume_training_state = self.cfg.get("resume_training_state", True)
+        load_strict = self.cfg.get("load_strict", True)
+        load_optimizer = self.cfg.get("load_optimizer", resume_training_state)
 
-        if self.auto_resume:
-            # Auto-resume mode: train until target_epochs is reached
-            remaining_epochs = self.target_epochs - self.epoch
-            if remaining_epochs <= 0:
-                log.info(f"[Auto-Resume] Training already completed! Checkpoint epoch {self.epoch} >= target {self.target_epochs}")
-                log.info(f"[Auto-Resume] Set train.n_epochs to a higher value if you want to continue training.")
-                self.n_epochs = 0
+        if resume_training_state:
+            self.epoch = data["epoch"]
+            self.first_epoch = self.epoch + 1
+
+            if self.auto_resume:
+                # Auto-resume mode: train until target_epochs is reached
+                remaining_epochs = self.target_epochs - self.epoch
+                if remaining_epochs <= 0:
+                    log.info(f"[Auto-Resume] Training already completed! Checkpoint epoch {self.epoch} >= target {self.target_epochs}")
+                    log.info(f"[Auto-Resume] Set train.n_epochs to a higher value if you want to continue training.")
+                    self.n_epochs = 0
+                else:
+                    self.n_epochs = remaining_epochs
+                    log.info(f"[Auto-Resume] Resuming from epoch {self.epoch}. Will train for {self.n_epochs} more epochs to reach target {self.target_epochs}.")
             else:
-                self.n_epochs = remaining_epochs
-                log.info(f"[Auto-Resume] Resuming from epoch {self.epoch}. Will train for {self.n_epochs} more epochs to reach target {self.target_epochs}.")
+                # Legacy mode: train for another n_epochs
+                log.info(f"Resume from self.epoch={self.epoch}. Will start from self.first_epoch={self.first_epoch} and train for another {self.n_epochs} epochs.")
         else:
-            # Legacy mode: train for another n_epochs
-            log.info(f"Resume from self.epoch={self.epoch}. Will start from self.first_epoch={self.first_epoch} and train for another {self.n_epochs} epochs.")
+            log.info("Warm-starting model weights only; epoch, optimizer, and scheduler state are left fresh.")
 
-        self.model.load_state_dict(data["model"])
-        self.ema_model.load_state_dict(data["ema"])
-        self.optimizer.load_state_dict(data["optimizer"])
-        self.lr_scheduler.load_state_dict(data["lr_scheduler"])
+        model_state = data["model"] if isinstance(data, dict) and "model" in data else data
+        ema_state = data.get("ema", model_state) if isinstance(data, dict) else model_state
+
+        model_msg = self.model.load_state_dict(model_state, strict=load_strict)
+        ema_msg = self.ema_model.load_state_dict(ema_state, strict=load_strict)
+        if not load_strict:
+            log.info(f"Non-strict model load result: {model_msg}")
+            log.info(f"Non-strict EMA load result: {ema_msg}")
+
+        if load_optimizer:
+            self.optimizer.load_state_dict(data["optimizer"])
+            self.lr_scheduler.load_state_dict(data["lr_scheduler"])
     
     # log loss
     def log(self, epoch, loss_train, loss_val, timer):

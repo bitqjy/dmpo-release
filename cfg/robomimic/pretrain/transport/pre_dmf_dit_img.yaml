@@ -1,14 +1,14 @@
+env_suite: robomimic
 ######################################################################
 # environment and task
-env_suite: robomimic
-env: lift
+env: transport
 
 # future action forecasts
-action_dim: 7
-horizon_steps: 4
+action_dim: 14
+horizon_steps: 8
 
 # observation history
-obs_dim: 9
+obs_dim: 18
 cond_steps: 1
 img_cond_steps: 1
 
@@ -16,11 +16,11 @@ img_cond_steps: 1
 shape_meta:
   obs:
     rgb:
-      shape: [3, 96, 96]
+      shape: [6, 96, 96]
     state:
-      shape: [9]
+      shape: [18]
   action:
-    shape: [7]
+    shape: [14]
 ###################################################################
 
 defaults:
@@ -29,11 +29,12 @@ hydra:
   run:
     dir: ${logdir}
 _target_: agent.pretrain.train_dmf_agent.TrainDecoupledMeanFlowAgent
-name: ${env}_pre_dmf_mlp_img_ta${horizon_steps}_td${denoising_steps}
+name: ${env}_pre_dmf_dit_img_ta${horizon_steps}_td${denoising_steps}
 logdir: ${oc.env:REINFLOW_LOG_DIR}/robomimic/pretrain/${env}/${name}/${now:%Y-%m-%d}_${now:%H-%M-%S}_${seed}
 train_dataset_path: ${oc.env:REINFLOW_DATA_DIR}/robomimic/${env}-img/train.npz
+normalization_path: ${oc.env:REINFLOW_DATA_DIR}/robomimic/${env}-img/normalization.npz
 
-# Optional: set this to a trained ReFlow checkpoint to warm-start DMF.
+# Optional: set this to a trained transport ReFlow checkpoint to warm-start DMF.
 base_policy_path:
 resume_training_state: false
 load_strict: false
@@ -64,17 +65,19 @@ train:
     min_lr: 1e-5
   epoch_start_ema: 20
   update_ema_freq: 10
-  save_model_freq: 100
+  save_model_freq: 250
   log_freq: 25
+  max_grad_norm: 1.0
 
 model:
   _target_: model.flow.dmf.DecoupledMeanFlow
   network:
-    _target_: model.flow.mlp_dmf.DecoupledVisionFlowMLP
+    _target_: model.flow.dit.DecoupledVisionActionDiT
     backbone:
       _target_: model.common.vit.VitEncoder
       obs_shape: ${shape_meta.obs.rgb.shape}
-      num_channel: ${eval:'${shape_meta.obs.rgb.shape[0]} * ${img_cond_steps}'}
+      num_channel: ${eval:'3 * ${img_cond_steps}'}
+      use_sdpa: false
       cfg:
         patch_size: 8
         depth: 1
@@ -82,12 +85,20 @@ model:
         num_heads: 4
         embed_style: embed2
         embed_norm: 0
-    img_cond_steps: ${img_cond_steps}
     augment: true
+    num_img: 2
     spatial_emb: 128
-    time_dim: 32
-    mlp_dims: [512, 512, 512]
-    residual_style: true
+    hidden_size: 384
+    depth: 8
+    dmf_depth: 5
+    num_heads: 6
+    mlp_ratio: 4.0
+    dropout: 0.0
+    activation: gelu
+    qk_norm: true
+    use_logvar: true
+    time_frequency_dim: 256
+    img_cond_steps: ${img_cond_steps}
     cond_dim: ${eval:'${obs_dim} * ${cond_steps}'}
     horizon_steps: ${horizon_steps}
     action_dim: ${action_dim}
@@ -109,9 +120,10 @@ model:
   flow_loss_weight: 0.5
   meanflow_loss_weight: 0.5
   flow_ratio: 0.0
-  loss_type: mse
+  loss_type: logvar
   gamma: 0.5
   c: 1e-3
+  logvar_eps: 1e-2
   sampling_shift: 1.0
   freeze_encoder: false
 

@@ -166,6 +166,7 @@ class PreTrainAgent:
         self.epoch_start_ema = cfg.train.get("epoch_start_ema", 20)
         self.update_ema_freq = cfg.train.get("update_ema_freq", 10)
         self.val_freq = cfg.train.get("val_freq", 100)
+        self.max_grad_norm = cfg.train.get("max_grad_norm", None)
         
         # Build dataset
         self.dataset_train = hydra.utils.instantiate(cfg.train_dataset)
@@ -426,6 +427,8 @@ class PreTrainAgent:
                 if self.verbose_loss: 
                     print(f"epoch: {epoch}/{self.first_epoch + self.n_epochs}={epoch/(self.n_epochs-self.first_epoch)*100:2.2f}%, steps: {step}, loss: {loss_train.item():3.4}", end="\r")
 
+                if self.max_grad_norm is not None and self.max_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                 self.optimizer.step()
                 if self.schedule_lr_each_grad_step:
                     self.lr_scheduler.step()

@@ -1,7 +1,7 @@
 # MIT License
 
 """
-Decoupled MeanFlow wrapper for ReFlow-style policies.
+Decoupled MeanFlow wrapper for DiT-based ReFlow policies.
 
 This keeps ReinFlow's noise-to-data convention:
     x_t = t * x_data + (1 - t) * noise,  t in [0, 1].
@@ -16,8 +16,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
-
-from model.flow.mlp_dmf import DecoupledFlowMLP
 
 log = logging.getLogger(__name__)
 Sample = namedtuple("Sample", "trajectories chains")
@@ -42,6 +40,11 @@ def _cauchy_loss(error: Tensor, c: float = 1e-3) -> Tensor:
     return torch.log(delta_sq + c).mean()
 
 
+def _logvar_loss(error: Tensor, logvar: Tensor, eps: float = 1e-2) -> Tensor:
+    delta_sq = torch.mean(error ** 2, dim=tuple(range(1, error.ndim)), keepdim=True)
+    return (torch.log(torch.exp(-logvar) * delta_sq + eps) + logvar).mean()
+
+
 class DecoupledMeanFlow(nn.Module):
     """
     DMF policy for accelerating ReFlow sampling with average velocities.
@@ -53,7 +56,7 @@ class DecoupledMeanFlow(nn.Module):
 
     def __init__(
         self,
-        network: DecoupledFlowMLP,
+        network: nn.Module,
         device: torch.device,
         horizon_steps: int,
         action_dim: int,
@@ -75,6 +78,7 @@ class DecoupledMeanFlow(nn.Module):
         loss_type: str = "mse",
         gamma: float = 0.5,
         c: float = 1e-3,
+        logvar_eps: float = 1e-2,
         clamp_training_actions: bool = False,
         sampling_shift: float = 1.0,
         freeze_encoder: bool = False,
@@ -108,6 +112,7 @@ class DecoupledMeanFlow(nn.Module):
         self.loss_type = loss_type
         self.gamma = gamma
         self.c = c
+        self.logvar_eps = logvar_eps
         self.clamp_training_actions = clamp_training_actions
         self.sampling_shift = sampling_shift
         self.last_loss_info = {}
@@ -165,7 +170,17 @@ class DecoupledMeanFlow(nn.Module):
             return _adaptive_l2_loss(error, gamma=self.gamma, c=self.c)
         if self.loss_type == "cauchy":
             return _cauchy_loss(error, c=self.c)
+        if self.loss_type == "logvar":
+            raise ValueError("loss_type=logvar requires _loss_from_prediction with return_logvar=True")
         raise ValueError(f"Unknown loss_type={self.loss_type}")
+
+    def _loss_from_prediction(self, prediction: Tensor, target: Tensor, logvar: Tensor = None) -> Tensor:
+        error = prediction - stopgrad(target)
+        if self.loss_type == "logvar":
+            if logvar is None:
+                raise ValueError("loss_type=logvar requires the network to return logvar")
+            return _logvar_loss(error, logvar, eps=self.logvar_eps)
+        return self._loss_from_error(error)
 
     def loss(self, x1: Tensor, cond: dict) -> Tensor:
         if self.clamp_training_actions:
@@ -177,8 +192,11 @@ class DecoupledMeanFlow(nn.Module):
         x0_fm = torch.randn_like(x1)
         xt_fm = self.generate_trajectory(x1, x0_fm, t_fm)
         v_fm = self._velocity_target(x1, x0_fm)
-        u_fm = self.network(xt_fm, t_fm, t_fm, cond)
-        fm_loss = self._loss_from_error(u_fm - stopgrad(v_fm))
+        if self.loss_type == "logvar":
+            u_fm, lv_fm = self.network(xt_fm, t_fm, t_fm, cond, return_logvar=True)
+        else:
+            u_fm, lv_fm = self.network(xt_fm, t_fm, t_fm, cond), None
+        fm_loss = self._loss_from_prediction(u_fm, v_fm, lv_fm)
 
         # MeanFlow / flow-map loss.
         t_mf, r_mf = self.sample_time_pair(batch_size)
@@ -186,17 +204,27 @@ class DecoupledMeanFlow(nn.Module):
         xt_mf = self.generate_trajectory(x1, x0_mf, t_mf)
         v_mf = self._velocity_target(x1, x0_mf)
 
-        def network_fn(z, t_val, r_val):
-            return self.network(z, t_val, r_val, cond)
+        if self.loss_type == "logvar":
+            def network_fn(z, t_val, r_val):
+                return self.network(z, t_val, r_val, cond, return_logvar=True)
 
-        u, du_dt = torch.autograd.functional.jvp(
-            network_fn,
-            (xt_mf, t_mf, r_mf),
-            (v_mf, torch.ones_like(t_mf), torch.zeros_like(r_mf)),
-            create_graph=True,
-        )
+            (u, lv_mf), (du_dt, _) = torch.func.jvp(
+                network_fn,
+                (xt_mf, t_mf, r_mf),
+                (v_mf, torch.ones_like(t_mf), torch.zeros_like(r_mf)),
+            )
+        else:
+            def network_fn(z, t_val, r_val):
+                return self.network(z, t_val, r_val, cond)
+
+            u, du_dt = torch.func.jvp(
+                network_fn,
+                (xt_mf, t_mf, r_mf),
+                (v_mf, torch.ones_like(t_mf), torch.zeros_like(r_mf)),
+            )
+            lv_mf = None
         u_target = v_mf + _expand_time(r_mf - t_mf, u) * du_dt
-        mf_loss = self._loss_from_error(u - stopgrad(u_target))
+        mf_loss = self._loss_from_prediction(u, u_target, lv_mf)
 
         loss = self.flow_loss_weight * fm_loss + self.meanflow_loss_weight * mf_loss
         self.last_loss_info = {
@@ -244,3 +272,93 @@ class DecoupledMeanFlow(nn.Module):
 
         x_hat = x_hat.clamp(*self.act_range)
         return Sample(trajectories=x_hat, chains=x_hat_list)
+
+
+class DecoupledImprovedMeanFlow(DecoupledMeanFlow):
+    """
+    DMF policy with the iMF v-loss target.
+
+    The architecture and sampler are the same as DecoupledMeanFlow.  Training
+    keeps the boundary FM loss, but replaces the MF target with the iMF
+    composite velocity:
+
+        V_theta = u_theta(x_t, t, r) - (r - t) stopgrad(du/dt)
+
+    under ReinFlow's noise-to-data convention.  The JVP tangent uses the
+    predicted boundary velocity v_theta = u_theta(x_t, t, t), matching the iMF
+    trick that avoids differentiating through a target depending on the ground
+    truth velocity.
+    """
+
+    def __init__(
+        self,
+        *args,
+        detach_predicted_velocity: bool = True,
+        detach_dudt: bool = True,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.detach_predicted_velocity = detach_predicted_velocity
+        self.detach_dudt = detach_dudt
+
+    def _predicted_velocity(self, xt: Tensor, t: Tensor, cond: dict) -> Tensor:
+        if self.detach_predicted_velocity:
+            with torch.no_grad():
+                return self.network(xt, t, t, cond)
+        return self.network(xt, t, t, cond)
+
+    def loss(self, x1: Tensor, cond: dict) -> Tensor:
+        if self.clamp_training_actions:
+            x1 = x1.clamp(*self.act_range)
+        batch_size = x1.shape[0]
+
+        # Boundary flow-matching loss, identical to DecoupledMeanFlow.
+        t_fm = self.sample_time(batch_size, mean=self.P_mean, std=self.P_std)
+        x0_fm = torch.randn_like(x1)
+        xt_fm = self.generate_trajectory(x1, x0_fm, t_fm)
+        v_fm = self._velocity_target(x1, x0_fm)
+        if self.loss_type == "logvar":
+            u_fm, lv_fm = self.network(xt_fm, t_fm, t_fm, cond, return_logvar=True)
+        else:
+            u_fm, lv_fm = self.network(xt_fm, t_fm, t_fm, cond), None
+        fm_loss = self._loss_from_prediction(u_fm, v_fm, lv_fm)
+
+        # iMF v-loss branch.
+        t_mf, r_mf = self.sample_time_pair(batch_size)
+        x0_mf = torch.randn_like(x1)
+        xt_mf = self.generate_trajectory(x1, x0_mf, t_mf)
+        v_mf = self._velocity_target(x1, x0_mf)
+        v_pred = self._predicted_velocity(xt_mf, t_mf, cond)
+
+        if self.loss_type == "logvar":
+            def network_fn(z, t_val, r_val):
+                return self.network(z, t_val, r_val, cond, return_logvar=True)
+
+            (u, lv_mf), (du_dt, _) = torch.func.jvp(
+                network_fn,
+                (xt_mf, t_mf, r_mf),
+                (v_pred, torch.ones_like(t_mf), torch.zeros_like(r_mf)),
+            )
+        else:
+            def network_fn(z, t_val, r_val):
+                return self.network(z, t_val, r_val, cond)
+
+            u, du_dt = torch.func.jvp(
+                network_fn,
+                (xt_mf, t_mf, r_mf),
+                (v_pred, torch.ones_like(t_mf), torch.zeros_like(r_mf)),
+            )
+            lv_mf = None
+
+        if self.detach_dudt:
+            du_dt = stopgrad(du_dt)
+        v_theta = u - _expand_time(r_mf - t_mf, u) * du_dt
+        imf_loss = self._loss_from_prediction(v_theta, v_mf, lv_mf)
+
+        loss = self.flow_loss_weight * fm_loss + self.meanflow_loss_weight * imf_loss
+        self.last_loss_info = {
+            "fm_loss": float(fm_loss.detach().cpu()),
+            "imf_loss": float(imf_loss.detach().cpu()),
+            "loss": float(loss.detach().cpu()),
+        }
+        return loss

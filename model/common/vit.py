@@ -44,6 +44,7 @@ class VitEncoderConfig:
     stride: int = -1
     embed_style: str = "embed2"
     embed_norm: int = 0
+    use_sdpa: bool = True
 
 
 class VitEncoder(nn.Module):
@@ -54,10 +55,13 @@ class VitEncoder(nn.Module):
         num_channel=3,
         img_h=96,
         img_w=96,
+        use_sdpa=None,
     ):
         super().__init__()
         self.obs_shape = obs_shape
         self.cfg = cfg
+        if use_sdpa is None:
+            use_sdpa = getattr(cfg, "use_sdpa", True)
         self.vit = MinVit(
             embed_style=cfg.embed_style,
             embed_dim=cfg.embed_dim,
@@ -67,6 +71,7 @@ class VitEncoder(nn.Module):
             num_channel=num_channel,
             img_h=img_h,
             img_w=img_w,
+            use_sdpa=use_sdpa,
         )
         self.img_h = img_h
         self.img_w = img_w
@@ -122,11 +127,12 @@ class PatchEmbed2(nn.Module):
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, embed_dim, num_head):
+    def __init__(self, embed_dim, num_head, use_sdpa=True):
         super().__init__()
         assert embed_dim % num_head == 0
 
         self.num_head = num_head
+        self.use_sdpa = use_sdpa
         self.qkv_proj = nn.Linear(embed_dim, 3 * embed_dim)
         self.out_proj = nn.Linear(embed_dim, embed_dim)
 
@@ -138,10 +144,8 @@ class MultiHeadAttention(nn.Module):
         q, k, v = einops.rearrange(
             qkv, "b t (k h d) -> b k h t d", k=3, h=self.num_head
         ).unbind(1)
-        # Compatibility fix: check if scaled_dot_product_attention is supported
-        if hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
-            # Newer PyTorch version, use optimized attention
-            if hasattr(torch.backends.cuda, 'sdp_kernel'):
+        if self.use_sdpa and hasattr(torch.nn.functional, "scaled_dot_product_attention"):
+            if hasattr(torch.backends.cuda, "sdp_kernel"):
                 with torch.backends.cuda.sdp_kernel(enable_math=False):
                     attn_v = torch.nn.functional.scaled_dot_product_attention(
                         q, k, v, dropout_p=0.0, attn_mask=attn_mask
@@ -150,25 +154,25 @@ class MultiHeadAttention(nn.Module):
                 attn_v = torch.nn.functional.scaled_dot_product_attention(
                     q, k, v, dropout_p=0.0, attn_mask=attn_mask
                 )
-        else:
-            # Older PyTorch version, manually implement attention mechanism
-            d_k = q.size(-1)
-            # q: (b, h, t, d), k: (b, h, t, d), v: (b, h, t, d)
-            attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (d_k ** 0.5)
-            if attn_mask is not None:
-                attn_scores = attn_scores.masked_fill(attn_mask == 0, -1e9)
-            attn_weights = torch.nn.functional.softmax(attn_scores, dim=-1)
-            attn_v = torch.matmul(attn_weights, v)
+            attn_v = einops.rearrange(attn_v, "b h t d -> b t (h d)")
+            return self.out_proj(attn_v)
+
+        d_k = q.size(-1)
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (d_k ** 0.5)
+        if attn_mask is not None:
+            attn_scores = attn_scores.masked_fill(attn_mask == 0, -1e9)
+        attn_weights = torch.nn.functional.softmax(attn_scores, dim=-1)
+        attn_v = torch.matmul(attn_weights, v)
         attn_v = einops.rearrange(attn_v, "b h t d -> b t (h d)")
         return self.out_proj(attn_v)
 
 
 class TransformerLayer(nn.Module):
-    def __init__(self, embed_dim, num_head, dropout):
+    def __init__(self, embed_dim, num_head, dropout, use_sdpa=True):
         super().__init__()
 
         self.layer_norm1 = nn.LayerNorm(embed_dim)
-        self.mha = MultiHeadAttention(embed_dim, num_head)
+        self.mha = MultiHeadAttention(embed_dim, num_head, use_sdpa=use_sdpa)
 
         self.layer_norm2 = nn.LayerNorm(embed_dim)
         self.linear1 = nn.Linear(embed_dim, 4 * embed_dim)
@@ -196,6 +200,7 @@ class MinVit(nn.Module):
         num_channel=3,
         img_h=96,
         img_w=96,
+        use_sdpa=True,
     ):
         super().__init__()
 
@@ -221,7 +226,8 @@ class MinVit(nn.Module):
             torch.zeros(1, self.patch_embed.num_patch, embed_dim)
         )
         layers = [
-            TransformerLayer(embed_dim, num_head, dropout=0) for _ in range(depth)
+            TransformerLayer(embed_dim, num_head, dropout=0, use_sdpa=use_sdpa)
+            for _ in range(depth)
         ]
 
         self.net = nn.Sequential(*layers)

@@ -148,10 +148,10 @@ class FlowMLP(nn.Module):
         x_hat:Tensor=z if z is not None else torch.randn(B, self.horizon_steps, self.action_dim, device=device)
         if save_chains:
             x_chain=torch.zeros((B, inference_steps+1, self.horizon_steps, self.action_dim), device=device)
-        dt = (1 / inference_steps) * torch.ones_like(x_hat, device=device)
-        steps = torch.linspace(0, 1, inference_steps, device=device).repeat(B, 1)
+        dt = 1.0 / inference_steps
+        steps = torch.linspace(0.0, 1.0, inference_steps + 1, device=device)[:-1]
         for i in range(inference_steps):
-            t = steps[:, i]
+            t = steps[i].expand(B)
             vt = self.forward(x_hat, t, cond)
             x_hat += vt * dt
             if clip_intermediate_actions or i == inference_steps-1: # always clip the output action. appended by ReinFlow Authors on 04/25/2025

@@ -194,10 +194,10 @@ class ReFlow(nn.Module):
         if record_intermediate:
             x_hat_list = torch.zeros((inference_steps,) + self.data_shape, device=self.device)
         x_hat = z if z is not None else torch.randn((B,) + self.data_shape, device=self.device)
-        dt = (1 / inference_steps) * torch.ones_like(x_hat, device=self.device)
-        steps = torch.linspace(0, 1, inference_steps, device=self.device).repeat(B, 1)
+        dt = 1.0 / inference_steps
+        steps = torch.linspace(0.0, 1.0, inference_steps + 1, device=self.device)[:-1]
         for i in range(inference_steps):
-            t = steps[:, i]
+            t = steps[i].expand(B)
             vt = self.network(x_hat, t, cond)
             x_hat += vt * dt
             if clip_intermediate_actions or i == inference_steps-1: # always clip the output action. appended by ReinFlow Authors on 04/25/2025
